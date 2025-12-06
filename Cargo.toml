@@ -2,39 +2,70 @@
 name = "parzel"
 version = "0.1.0"
 edition = "2024"
+description = "A high-performance search engine kernel for WebAssembly"
+license = "MIT OR Apache-2.0"
 
 [lib]
-# 'cdylib' es necesario para generar el archivo .wasm final que consume el navegador.
-# 'rlib' permite que este crate sea usado como dependencia en otros proyectos Rust (ej: el indexador offline).
+# 'cdylib' generates the .wasm file for browser consumption
+# 'rlib' allows this crate to be used as a dependency in other Rust projects
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "parzel-cli"
+path = "src/main.rs"
+
+[[bench]]
+name = "search_bench"
+harness = false
+
 [dependencies]
-# 1. Asignador de Memoria
-# Lo hacemos opcional para poder desactivarlo si alguna vez debuggeamos con std
+# Memory allocator (WASM only)
 lol_alloc = { version = "0.4.1", optional = true }
 
-# 2. Compresión
-# Bitpacking v0.9 soporta no_std desactivando default-features.
+# Compression - supports no_std
 bitpacking = { version = "0.9", default-features = false, features = ["bitpacker4x"] }
 
-# 3. Estructuras de Datos
+# Data structures
 fst = { version = "0.4", default-features = false }
 
-# 4. Runtime WASM (Necesario para interoperabilidad JS)
+# WASM runtime (needed for JS interop)
 wasm-bindgen = "0.2"
 
 [dev-dependencies]
-# CRÍTICO: Esto solo se usa durante 'cargo test' o 'wasm-pack test'.
-# No contamina el binario de producción.
 wasm-bindgen-test = "0.3"
+criterion = { version = "0.5", default-features = false }
+rand = "0.8"
 
 [profile.release]
-opt-level = "z"       # Optimización máxima de tamaño
-lto = true            # Link Time Optimization global
-codegen-units = 1     # Un solo hilo de compilación para mejor análisis estático
-panic = "abort"       # Sin unwinding (ahorra ~20KB)
-strip = true          # Strip symbols (ahorra ~50KB)
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Profile para profiling con perf/flamegraph
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = false
+opt-level = 3
+panic = "unwind"
+
+# Profile for benchmarking - must use unwind for Criterion
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true  # Needed for flamegraph symbols
+panic = "unwind"
+
+[profile.dev]
+# Required for native testing
+panic = "unwind"
 
 [features]
 default = ["lol_alloc"]
 lol_alloc = ["dep:lol_alloc"]
+
+# Feature to build for native targets (testing/benchmarking)
+std = []
