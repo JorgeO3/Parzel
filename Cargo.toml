@@ -1,0 +1,40 @@
+[package]
+name = "parzel"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# 'cdylib' es necesario para generar el archivo .wasm final que consume el navegador.
+# 'rlib' permite que este crate sea usado como dependencia en otros proyectos Rust (ej: el indexador offline).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 1. Asignador de Memoria
+# Lo hacemos opcional para poder desactivarlo si alguna vez debuggeamos con std
+lol_alloc = { version = "0.4.1", optional = true }
+
+# 2. Compresión
+# Bitpacking v0.9 soporta no_std desactivando default-features.
+bitpacking = { version = "0.9", default-features = false, features = ["bitpacker4x"] }
+
+# 3. Estructuras de Datos
+fst = { version = "0.4", default-features = false }
+
+# 4. Runtime WASM (Necesario para interoperabilidad JS)
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+# CRÍTICO: Esto solo se usa durante 'cargo test' o 'wasm-pack test'.
+# No contamina el binario de producción.
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+opt-level = "z"       # Optimización máxima de tamaño
+lto = true            # Link Time Optimization global
+codegen-units = 1     # Un solo hilo de compilación para mejor análisis estático
+panic = "abort"       # Sin unwinding (ahorra ~20KB)
+strip = true          # Strip symbols (ahorra ~50KB)
+
+[features]
+default = ["lol_alloc"]
+lol_alloc = ["dep:lol_alloc"]
