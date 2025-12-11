@@ -1,7 +1,9 @@
-//! Safe memory access abstractions for byte slices.
-//!
-//! Provides efficient, bounds-checked access patterns for reading
-//! binary data without unnecessary allocations.
+use crate::prelude::*;
+
+// Safe memory access abstractions for byte slices.
+//
+// Provides efficient, bounds-checked access patterns for reading
+// binary data without unnecessary allocations.
 
 /// Extension trait for safe byte slice operations.
 ///

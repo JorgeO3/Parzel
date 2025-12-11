@@ -6,44 +6,31 @@ description = "A high-performance search engine kernel for WebAssembly"
 license = "MIT OR Apache-2.0"
 
 [lib]
-# 'cdylib' generates the .wasm file for browser consumption
-# 'rlib' allows this crate to be used as a dependency in other Rust projects
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "parzel-cli"
 path = "src/main.rs"
 
-[[bench]]
-name = "search_bench"
-harness = false
-
 [dependencies]
-# Memory allocator (WASM only)
+wasm-bindgen = { version = "0.2.106", optional = false }
 lol_alloc = { version = "0.4.1", optional = true }
-
-# Compression - supports no_std
-bitpacking = { version = "0.9", default-features = false, features = ["bitpacker4x"] }
-
-# Data structures
-fst = { version = "0.4", default-features = false }
-
-# WASM runtime (needed for JS interop)
-wasm-bindgen = "0.2"
+thiserror = { version = "2.0.17", default-features = false }
+fst = { version = "0.4.7", default-features = false }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
-criterion = { version = "0.5", default-features = false }
-rand = "0.8"
+criterion = { version = "0.8.1", default-features = false }
+rand = "0.9.2"
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [profile.release]
 opt-level = "z"
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
 
-# Profile para profiling con perf/flamegraph
 [profile.profiling]
 inherits = "release"
 debug = "full"
@@ -51,21 +38,43 @@ strip = false
 opt-level = 3
 panic = "unwind"
 
-# Profile for benchmarking - must use unwind for Criterion
-[profile.bench]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-debug = true  # Needed for flamegraph symbols
-panic = "unwind"
-
 [profile.dev]
 # Required for native testing
 panic = "unwind"
 
-[features]
-default = ["lol_alloc"]
-lol_alloc = ["dep:lol_alloc"]
+[profile.wasm-profiling]
+inherits = "release"
+debug = 2            # Símbolos DWARF para sourcemaps
+strip = false        # NO eliminar símbolos
+opt-level = "z"
+lto = "thin"         # LTO menos agresivo para mejores stacks
 
-# Feature to build for native targets (testing/benchmarking)
+[features]
+default = ["lol_alloc", "simd128"]
+lol_alloc = ["dep:lol_alloc"]
+simd128 = []
 std = []
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = [
+    "-Oz",
+    "--enable-simd",            # Habilitar la instrucción SIMD v128 (performance).
+    "--enable-bulk-memory",     # Habilitar instrucciones de movimiento de memoria (performance).
+    "--enable-mutable-globals", # Habilitar el uso de variables globales mutables (menor tamaño).
+    "--enable-tail-call",       # Habilitar llamadas de cola para la refactorización de recursión (Vector #2.2).
+
+    # Secuencia de convergencia (Vector #3)
+    "--converge",                 # Ejecuta pases de optimización hasta que el tamaño ya no se reduce.
+    "--inlining-optimizing",      # Inlining agresivo que rompe abstracciones para exponer código muerto.
+    "--dae-optimizing",           # Elimina argumentos de funciones que no se usan (común en monomorfización genérica).
+    "--coalesce-locals-learning", # Reordena variables locales para reducir el tamaño de las instrucciones LEB128.
+
+    # Pases de limpieza adicionales
+    "--remove-unused-module-elements", # Limpieza de funciones y elementos sin usar.
+    "--code-folding",                  # Simplifica y colapsa bloques de código idénticos.
+    "--merge-blocks",                  # Fusiona bloques básicos consecutivos.
+    "--reorder-locals",                # Optimiza el orden de las variables locales.
+    "--vacuum",                        # Limpieza final de código muerto.
+    "--memory-packing",                # Optimiza el uso y el tamaño del segmento de datos.
+    "--strip-producers",               # Elimina la sección "producers" (metadatos innecesarios).
+]

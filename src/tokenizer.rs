@@ -18,66 +18,40 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Creates a new tokenizer instance.
     #[inline]
-    #[must_use]
     pub const fn new() -> Self {
         Self { _private: () }
     }
 
-    /// Tokenizes input text into an array of term IDs.
+    /// Tokenizes input text into an array of string slices.
     ///
     /// # Arguments
-    /// * `text` - Input text to tokenize
-    /// * `out` - Output buffer for term IDs
+    /// * `text` - Input text to tokenize.
+    /// * `out` - Output buffer to store the resulting string slices.
     ///
     /// # Returns
-    /// Number of tokens written to `out`
+    /// Number of tokens written to `out`.
     ///
     /// # Algorithm
-    /// - Splits on ASCII whitespace
-    /// - Generates a simple hash as term ID based on word length
-    /// - Skips empty tokens
-    pub fn tokenize(&self, text: &str, out: &mut [u64]) -> usize {
-        let bytes = text.as_bytes();
-        let max_tokens = out.len();
+    /// - Uses `split_ascii_whitespace` iterator which handles leading/trailing spaces
+    ///   and consecutive delimiters automatically.
+    /// - Uses `zip` to pair tokens with the output buffer slots, ensuring we never
+    ///   write out of bounds (eliminating bounds checks).
+    pub fn tokenize<'a>(&self, text: &'a str, out: &mut [&'a str]) -> usize {
+        // Iterator magic:
+        // 1. split_ascii_whitespace(): Generates slices of words, skipping all spaces.
+        // 2. take(out.len()): Ensures we stop if the text has more words than the buffer.
+        // 3. zip(out.iter_mut()): Pairs each found token with a mutable slot in 'out'.
+        //    Crucially, 'zip' stops when EITHER iterator is exhausted.
 
         let mut count = 0;
-        let mut start = 0;
 
-        while start < bytes.len() && count < max_tokens {
-            // Skip leading whitespace
-            while start < bytes.len() && is_whitespace(bytes[start]) {
-                start += 1;
-            }
-
-            if start >= bytes.len() {
-                break;
-            }
-
-            // Find end of token
-            let mut end = start;
-            while end < bytes.len() && !is_whitespace(bytes[end]) {
-                end += 1;
-            }
-
-            let token_len = end - start;
-            if token_len > 0 {
-                // Simple term ID: hash based on length and first byte
-                let first_byte = u64::from(bytes[start]);
-                out[count] = first_byte.wrapping_mul(100).wrapping_add(token_len as u64);
-                count += 1;
-            }
-
-            start = end;
+        for (token, slot) in text.split_ascii_whitespace().zip(out.iter_mut()) {
+            *slot = token;
+            count += 1;
         }
 
         count
     }
-}
-
-/// Checks if a byte is ASCII whitespace.
-#[inline]
-const fn is_whitespace(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
 #[cfg(test)]
@@ -87,30 +61,30 @@ mod tests {
     #[test]
     fn empty_input() {
         let tokenizer = Tokenizer::new();
-        let mut out = [0u64; 4];
+        let mut out = [""; 4];
         assert_eq!(tokenizer.tokenize("", &mut out), 0);
     }
 
     #[test]
     fn whitespace_only() {
         let tokenizer = Tokenizer::new();
-        let mut out = [0u64; 4];
+        let mut out = [""; 4];
         assert_eq!(tokenizer.tokenize("   \t\n  ", &mut out), 0);
     }
 
     #[test]
     fn single_word() {
         let tokenizer = Tokenizer::new();
-        let mut out = [0u64; 4];
+        let mut out = [""; 4];
         let count = tokenizer.tokenize("hello", &mut out);
         assert_eq!(count, 1);
-        assert_ne!(out[0], 0);
+        assert_ne!(out[0], "");
     }
 
     #[test]
     fn multiple_words() {
         let tokenizer = Tokenizer::new();
-        let mut out = [0u64; 4];
+        let mut out = [""; 4];
         let count = tokenizer.tokenize("hello world", &mut out);
         assert_eq!(count, 2);
     }
@@ -118,7 +92,7 @@ mod tests {
     #[test]
     fn buffer_limit() {
         let tokenizer = Tokenizer::new();
-        let mut out = [0u64; 2];
+        let mut out = [""; 2];
         let count = tokenizer.tokenize("one two three four", &mut out);
         assert_eq!(count, 2);
     }
@@ -126,7 +100,7 @@ mod tests {
     #[test]
     fn extra_whitespace() {
         let tokenizer = Tokenizer::new();
-        let mut out = [0u64; 4];
+        let mut out = [""; 4];
         let count = tokenizer.tokenize("  hello   world  ", &mut out);
         assert_eq!(count, 2);
     }

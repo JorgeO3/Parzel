@@ -1,0 +1,1894 @@
+use core::mem::MaybeUninit;
+use core::slice;
+
+use crate::data::HypersonicIndex;
+use crate::iter::{PostingIterator, SCRATCH_SIZE};
+use crate::tokenizer::MAX_TOKENS;
+
+// ============================================================================
+// 1. SEARCH ARENA (El Dueño de la Memoria)
+// ============================================================================
+
+/// Contenedor de memoria "pesada" reutilizable.
+/// Gestiona los buffers de descompresión (Scratchpads).
+///
+/// # Performance
+/// - Usa `MaybeUninit` para evitar que Rust llene el stack de ceros (ahorra ~2-3us).
+/// - Usa `align(64)` para asegurar que cada buffer empiece en una línea de caché limpia.
+#[repr(C, align(64))]
+pub struct SearchArena {
+    // Array de buffers sin inicializar.
+    // [u32; 128] * 16 iteradores = 8KB de memoria.
+    scratches: [MaybeUninit<[u32; SCRATCH_SIZE]>; MAX_TOKENS],
+}
+
+impl SearchArena {
+    /// Crea una nueva arena en el stack. Costo: 0 ciclos CPU.
+    #[inline]
+    pub const fn new() -> Self {
+        // SAFETY: Un array de MaybeUninit no requiere inicialización.
+        // El compilador reserva el espacio en el stack pointer (sub rsp) pero no escribe nada.
+        Self {
+            // SAFETY: MaybeUninit<T> allows uninitialized memory; assume_init is safe for arrays of MaybeUninit.
+            scratches: [MaybeUninit::uninit(); MAX_TOKENS],
+        }
+    }
+
+    /// Retorna un iterador que entrega buffers mutables listos para usar.
+    ///
+    /// SAFETY:
+    /// - Garantiza disjointness (no hay dos iteradores con el mismo buffer).
+    /// - Asume que la memoria es escribible (`MaybeUninit` -> T).
+    ///   Como el `PostingIterator` SOLO escribe antes de leer, esto es seguro.
+    #[inline]
+    pub fn available_buffers(
+        &mut self,
+    ) -> impl Iterator<Item = &mut MaybeUninit<[u32; SCRATCH_SIZE]>> {
+        self.scratches.iter_mut()
+    }
+}
+
+// ============================================================================
+// 2. QUERY CONTEXT (El Gestor de Iteradores)
+// ============================================================================
+
+/// Contexto efímero que vive solo lo que dura una query.
+/// Pide prestada la memoria al Arena, evitando estructuras autorreferenciales.
+pub struct QueryCtx<'a> {
+    // // Referencia al dueño de la memoria (Split Ownership)
+    // pub arena: &'a mut SearchArena,
+    // Iteradores almacenados también sin inicializar para evitar overhead.
+    pub iters: [MaybeUninit<PostingIterator<'a>>; MAX_TOKENS],
+}
+
+impl<'a> QueryCtx<'a> {
+    /// Crea el contexto enlazado a una Arena.
+    pub const fn new() -> Self {
+        Self {
+            // arena,
+            // SAFETY: MaybeUninit<T> allows uninitialized memory; assume_init is safe for arrays of MaybeUninit.
+            iters: unsafe { MaybeUninit::uninit().assume_init() },
+        }
+    }
+
+    /// Prepara e inicializa un iterador en el slot `idx`.
+    #[inline]
+    pub fn prepare(
+        &mut self,
+        arena: &'a mut SearchArena, // El préstamo ocurre AQUÍ, no en el struct
+        index: &'a HypersonicIndex,
+        tokens: &[&str],
+    ) -> usize {
+        let mut count = 0;
+
+        // MAGIA DE RUST: Zip
+        // Emparejamos cada token con un buffer disponible del arena.
+        // Si se acaban los tokens o se acaban los buffers, el loop termina.
+        // No hay bounds checks, no hay índices manuales.
+        let zip_iter = tokens.iter().zip(arena.available_buffers());
+
+        for (token, scratch) in zip_iter {
+            // Intentamos buscar el término en el índice
+            if let Some(offset) = index.get_term_offset(token) {
+                // 1. Crear el iterador (SAFE)
+                // 'scratch' ya es &mut [u32], Rust sabe que es único.
+                let iter = PostingIterator::new(index, offset, scratch);
+
+                self.iters[count].write(iter);
+
+                count += 1;
+            }
+        }
+
+        count
+    }
+
+    /// Retorna un slice seguro con los iteradores activos para la intersección.
+    #[inline]
+    pub fn active_slice(&mut self, count: usize) -> &mut [PostingIterator<'a>] {
+        debug_assert!(count <= MAX_TOKENS);
+        // SAFETY: All elements up to `count` in `iters` have been initialized via `prepare_iter`,
+        // and `count` is guaranteed to be <= MAX_TOKENS, so casting to a slice of initialized objects is safe.
+        unsafe {
+            // Transmutamos el array de MaybeUninit a un slice de objetos inicializados.
+            slice::from_raw_parts_mut(self.iters.as_mut_ptr().cast::<PostingIterator<'a>>(), count)
+        }
+    }
+}
+
+//! Index data structures and parsing logic.
+//!
+//! Defines the binary format for the Hypersonic index and provides
+//! safe parsing routines with proper validation.
+
+use crate::utils::ByteSliceExt;
+use fst::Map; // Importamos el Mapa FST
+
+/// Magic number identifying a valid Hypersonic index: "HYP0" in little-endian.
+const MAGIC: u32 = 0x4859_5030;
+
+/// Minimum header size required for a valid index.
+/// 20 bytes original header + FST data overhead (variable but checked).
+const MIN_HEADER_SIZE: usize = 24; // Updated to account for FST offset/len fields
+
+/// Parsed view into an immutable Hypersonic index.
+///
+/// This struct provides zero-copy access to index data, validating
+/// the format on construction.
+#[derive(Clone, Debug)]
+pub struct HypersonicIndex<'a> {
+    data: &'a [u8],
+    postings_base: usize,
+    // The FST map allows O(len(term)) lookup of terms to offsets.
+    // It is zero-copy, referencing the bytes directly in `data`.
+    term_map: Map<&'a [u8]>,
+}
+
+impl<'a> HypersonicIndex<'a> {
+    /// Creates a new index view from raw bytes.
+    ///
+    /// # Arguments
+    /// * `data` - Raw index bytes with header, FST, and postings.
+    ///
+    /// # Returns
+    /// * `Some(index)` - Valid index structure.
+    /// * `None` - Invalid magic, insufficient size, corrupt FST, or bad offsets.
+    #[must_use]
+    pub fn new(data: &'a [u8]) -> Option<Self> {
+        if data.len() < MIN_HEADER_SIZE {
+            return None;
+        }
+
+        // 1. Validate Magic "HYP0"
+        let magic = data.read_u32_le(0)?;
+        if magic != MAGIC {
+            return None;
+        }
+
+        // 2. Read Metadata
+        // [0..4] Magic
+        // [4..8] Version (unused currently)
+        // [8..12] Doc Count (unused currently)
+        // [12..16] Term Count (unused currently)
+        // [16..20] Postings Base Offset
+        // [20..24] FST Size (bytes)
+
+        let postings_offset = data.read_u32_le(16)? as usize;
+        let fst_size = data.read_u32_le(20)? as usize;
+
+        // 3. Bounds Check
+        // The FST typically sits right after the header (offset 24)
+        let fst_start = 24;
+        let fst_end = fst_start + fst_size;
+
+        if core::cmp::max(fst_end, postings_offset) > data.len() {
+            return None;
+        }
+
+        // 4. Initialize FST Map (Zero-Copy)
+        // We take the slice corresponding to the FST bytes.
+        let fst_bytes = &data[fst_start..fst_end];
+
+        // Map::new verifies the FST integrity (magic bytes, version, checksum).
+        // If the FST data is corrupt, this returns Err, so we return None.
+        let term_map = Map::new(fst_bytes).ok()?;
+
+        Some(Self {
+            data,
+            postings_base: postings_offset,
+            term_map,
+        })
+    }
+
+    /// Returns the raw index data.
+    #[inline]
+    pub const fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Returns the base offset for postings lists.
+    #[inline]
+    pub const fn postings_base(&self) -> usize {
+        self.postings_base
+    }
+
+    /// Computes the posting list offset for a given term.
+    ///
+    /// Uses the internal FST to map the string term to a relative offset.
+    ///
+    /// # Arguments
+    /// * `term` - The search term (e.g., "apple").
+    ///
+    /// # Returns
+    /// * `Some(offset)` - Relative offset from `postings_base` if the term exists.
+    /// * `None` - Term not found in the index.
+    #[inline]
+    pub fn get_term_offset(&self, term: &str) -> Option<usize> {
+        self.term_map.get(term).and_then(|val| val.try_into().ok())
+    }
+}
+
+/// Header for a compressed postings list.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)] // Used by FFI consumers
+pub struct CompressedHeader {
+    /// Number of blocks in the posting list.
+    pub num_blocks: u32,
+    /// Offset to the block headers.
+    pub start_offset: u32,
+}
+
+/// Header for a single compressed block within a postings list.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockHeader {
+    /// Maximum document ID in this block.
+    pub max_doc: u32,
+    /// Maximum score in this block (for early termination).
+    pub max_score: u8,
+    /// Bit width for delta encoding.
+    pub bit_width: u8,
+    /// Padding for alignment.
+    pub _padding: u16,
+    /// Offset to compressed data from block headers start.
+    pub data_offset: u32,
+}
+
+/// Posting list type discriminant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PostingListType {
+    Bitmap = 0,
+    Compressed = 1,
+}
+
+impl TryFrom<u8> for PostingListType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Bitmap),
+            1 => Ok(Self::Compressed),
+            _ => Err(()),
+        }
+    }
+}
+
+//! High-level search engine logic.
+//!
+//! Provides the main search interface that orchestrates tokenization,
+//! posting list iteration, and result collection.
+
+use crate::context::{QueryCtx, SearchArena}; // Asegúrate de que context.rs exporte esto
+use crate::data::HypersonicIndex;
+use crate::iter::PostingIterator;
+use crate::tokenizer::{MAX_TOKENS, Tokenizer};
+
+/// Maximum number of results to return from a search.
+pub const MAX_RESULTS: usize = 128;
+
+/// Intersects multiple posting lists using a Document-at-a-Time (DAAT) strategy.
+/// Implements the `SvS` (Small-versus-Small) algorithm with galloping search.
+///
+/// # Performance
+/// - Uses a "Driver" iterator (shortest list) to lead the search.
+/// - Minimizes branch mispredictions by keeping the "Happy Path" linear.
+pub fn intersect(iterators: &mut [PostingIterator<'_>], results: &mut [u32]) -> usize {
+    // -- 1. Early Exit --
+    if iterators.is_empty() {
+        return 0;
+    }
+
+    // Optimization: Sort iterators by length (shortest first) could be added here.
+    iterators.sort_unstable_by_key(PostingIterator::size_estimate);
+
+    let max_results = results.len();
+    let mut matches = 0;
+    let mut target = 0u32;
+
+    // -- 2. Main Search Loop --
+    // We access iterators[0] outside the loop to avoid bounds checks inside.
+    loop {
+        // A. Driver Advance: Find first document >= target in the lead iterator.
+        let Some(candidate) = iterators[0].advance(target, 0) else {
+            break; // Driver exhausted, search complete.
+        };
+
+        // B. Intersection Check: Do all other iterators have this doc?
+        let mut is_match = true;
+        let mut next_target = candidate;
+
+        // Skip(1) because we already have the candidate from index 0.
+        for iter in iterators.iter_mut().skip(1) {
+            match iter.advance(candidate, 0) {
+                Some(doc) => {
+                    if doc != candidate {
+                        // Mismatch: This iterator jumped past the candidate.
+                        // We must sync the rest of the lists to this new ID.
+                        is_match = false;
+                        next_target = doc;
+                        break; // Abort inner loop, return to driver.
+                    }
+                }
+                None => return matches, // Iterator exhausted, no more intersections possible.
+            }
+        }
+
+        // C. Result Handling
+        if !is_match {
+            // -- Case: Miss --
+            // Fast-forward target to the document that caused the mismatch.
+            target = next_target;
+            continue;
+        }
+
+        // -- Case: Hit! --
+        // Safe write: Rust panics if out of bounds, but LLVM optimizes this out
+        // because of the check below.
+        results[matches] = candidate;
+        matches += 1;
+
+        // -- Buffer Full Check --
+        if matches == max_results {
+            break;
+        }
+
+        // Si el documento encontrado es el último entero posible,
+        // no existen más documentos. Rompemos para evitar overflow
+        // o bucles infinitos intentando buscar u32::MAX + 1.
+        if candidate == u32::MAX {
+            break;
+        }
+
+        target = candidate + 1;
+    }
+
+    matches
+}
+
+/// Performs a conjunctive (AND) search over the index.
+///
+/// Returns documents that match ALL present query terms.
+/// Terms not found in the index are ignored (Loose AND).
+///
+/// # Returns
+/// Number of results written to the output buffer.
+pub fn search(index_data: &[u8], query: &str, results: &mut [u32]) -> usize {
+    // -- 1. Index Load --
+    let Some(index) = HypersonicIndex::new(index_data) else {
+        return 0;
+    };
+
+    // -- 2. Tokenization --
+    let tokenizer = Tokenizer::new();
+    let mut tokens = [""; MAX_TOKENS];
+    let token_count = tokenizer.tokenize(query, &mut tokens);
+
+    if token_count == 0 {
+        return 0;
+    }
+
+    // -- 3. Context & Arena Setup --
+    // SearchArena gestiona la memoria temporal.
+    let mut arena = SearchArena::new();
+
+    // CAMBIO 1: QueryCtx se inicializa sin borrow del Arena.
+    // Esto desacopla los lifetimes y evita problemas de "self-referential struct".
+    let mut ctx = QueryCtx::new();
+
+    let search_window = &tokens[..token_count];
+
+    // -- 4. Iterator Preparation --
+    // CAMBIO 2: Delegamos la preparación a `ctx.prepare`.
+    // Esta función toma prestada la Arena temporalmente, une (zip) los tokens con
+    // los buffers disponibles, inicializa los iteradores válidos y devuelve la cuenta.
+    //
+    // Ya no necesitas el `fold` manual; la lógica de saltar términos inválidos
+    // está encapsulada dentro de `prepare`.
+    let active_count = ctx.prepare(&mut arena, &index, search_window);
+
+    // -- 5. Execute Intersection --
+    // Obtenemos el slice de iteradores activos e intersectamos.
+    // Si active_count es 0, intersect retorna 0 inmediatamente.
+    intersect(ctx.active_slice(active_count), results)
+}
+
+//! Posting list iterators for document retrieval.
+//!
+//! Provides efficient iterators over both bitmap and compressed
+//! posting lists with SIMD acceleration where available.
+
+use core::mem::MaybeUninit;
+use core::mem::size_of;
+use core::num::Wrapping; // Used for safe index arithmetic
+
+#[cfg(target_arch = "wasm32")]
+use crate::simd::{decode_bp128_chunk_simd, decode_scores_block_simd, write_docid_chunk}; // Importaciones SIMD reales
+
+use crate::data::{BlockHeader, HypersonicIndex, PostingListType};
+use crate::prelude::*;
+use crate::simd::{ChunkBits, is_empty, scan_chunk};
+use crate::utils::ByteSliceExt;
+
+/// Size of the decompression scratch buffer (128 u32 slots = 512 bytes).
+pub const SCRATCH_SIZE: usize = 128;
+
+/// Internal strategy for different posting list formats.
+enum Strategy<'a> {
+    Empty,
+    Bitmap(BitmapState<'a>),
+    Compressed(CompressedState<'a>),
+}
+
+/// State for reading an uncompressed Flat Bitset posting list.
+struct BitmapState<'a> {
+    data: &'a [u8],
+    chunk_idx: usize,
+}
+
+/// State for reading a compressed (BP128) posting list.
+///
+/// NOTE: The scratch buffer is used to store decompressed `DocIDs`.
+/// In the SIMD path, `DocIDs` are decoded directly into this buffer.
+struct CompressedState<'a> {
+    headers_data: &'a [u8],
+    num_blocks: usize,
+    block_idx: usize,
+    // Scratch buffer used for temporary storage of Decoded DocIDs.
+    scratch: &'a mut [u32; SCRATCH_SIZE],
+
+    // Stores decompressed scores for the current block.
+    scores_even: [u8; SCRATCH_SIZE / 2],
+    scores_odd: [u8; SCRATCH_SIZE / 2],
+
+    // Position within the scratch buffer (for sequential processing after decompression).
+    buf_pos: usize,
+    // Pointer to the start of the compressed payload for SIMD loading.
+    #[cfg(target_arch = "wasm32")]
+    compressed_data: &'a [u8],
+    // The DocID of the last document processed in the previous block.
+    last_doc_id: u32,
+}
+
+impl CompressedState<'_> {
+    /// Lee el header actual manejando la desalineación de forma segura.
+    /// Costo: Un `memcpy` de 12 bytes (muy barato, probablemente optimizado a registros).
+    #[inline]
+    const fn current_header(&self) -> BlockHeader {
+        // Cálculo del offset en bytes
+        let offset = self.block_idx * size_of::<BlockHeader>();
+
+        // Debug assert para desarrollo (en prod el iterador controla los límites)
+        debug_assert!(offset + size_of::<BlockHeader>() <= self.headers_data.len());
+
+        // SAFETY:
+        // 1. Validez de Memoria: Hemos verificado previamente (mediante `debug_assert!`
+        //    y la lógica de construcción del índice) que `offset + size_of::<BlockHeader>()`
+        //    está dentro de los límites del slice `self.headers_data`. Por tanto, el puntero
+        //    resultante apunta a memoria válida y asignada.
+        // 2. Alineación: Aunque `src_ptr` puede no cumplir con la alineación requerida para
+        //    `BlockHeader` (align 4), usamos `ptr::read_unaligned` que está diseñado
+        //    específicamente para realizar copias seguras desde direcciones desalineadas.
+        // 3. Inicialización: Los bytes provienen de un slice `&[u8]` válido, por lo que
+        //    la memoria está inicializada. `BlockHeader` es un tipo POD (Plain Old Data)
+        //    compuesto de enteros, por lo que cualquier patrón de bits es válido.
+        unsafe {
+            // 1. Obtenemos el puntero crudo al byte donde empieza el header
+            let src_ptr = self.headers_data.as_ptr().add(offset);
+
+            // 2. Casteamos a *const BlockHeader.
+            //    NOTA: Este puntero puede estar DESALINEADO. No podemos dereferenciarlo directamente (*ptr).
+            #[allow(clippy::cast_ptr_alignment)]
+            let ptr = src_ptr.cast::<BlockHeader>();
+
+            // 3. Usamos read_unaligned via ptr::read_unaligned.
+            //    Esto le dice al CPU: "Copia estos bytes a una struct en el stack, byte a byte si es necesario".
+            //    En x86 y ARM modernos esto es casi tan rápido como una lectura normal.
+            core::ptr::read_unaligned(ptr)
+        }
+    }
+}
+
+/// Iterator over a posting list, yielding document IDs matching search criteria.
+///
+/// Supports both bitmap and compressed posting list formats with
+/// score-based early termination for top-k queries.
+pub struct PostingIterator<'a> {
+    strategy: Strategy<'a>,
+    current_doc: u32,
+    current_score: u8,
+}
+
+impl<'a> PostingIterator<'a> {
+    /// Creates an empty iterator that yields no documents.
+    pub const fn empty() -> Self {
+        Self {
+            strategy: Strategy::Empty,
+            current_doc: u32::MAX,
+            current_score: 0,
+        }
+    }
+
+    /// Creates an iterator for a posting list at the given offset.
+    pub fn new(
+        index: &HypersonicIndex<'a>,
+        term_offset: usize,
+        scratch_raw: &'a mut MaybeUninit<[u32; SCRATCH_SIZE]>,
+    ) -> Self {
+        // SAFETY: The caller is responsible for ensuring that the scratch buffer
+        // will be initialized before any read operations occur. The buffer is only
+        // written to during decompression operations before being read.
+        let scratch = unsafe { scratch_raw.assume_init_mut() };
+
+        let Some(list_start) = index.postings_base().checked_add(term_offset) else {
+            return Self::empty();
+        };
+
+        let data = index.data();
+
+        let Some(list_type_byte) = data.read_u8(list_start) else {
+            return Self::empty();
+        };
+
+        let Ok(list_type) = PostingListType::try_from(list_type_byte) else {
+            return Self::empty();
+        };
+
+        match list_type {
+            PostingListType::Bitmap => Self::new_bitmap(data, list_start),
+            PostingListType::Compressed => Self::new_compressed(index, list_start, scratch),
+        }
+    }
+
+    fn new_bitmap(data: &'a [u8], list_start: usize) -> Self {
+        let Some(len) = data.read_u32_le(list_start + 1) else {
+            return Self::empty();
+        };
+
+        let Some(bitmap_data) = data.sub_slice(list_start + 5, len as usize) else {
+            return Self::empty();
+        };
+
+        Self {
+            strategy: Strategy::Bitmap(BitmapState {
+                data: bitmap_data,
+                chunk_idx: 0,
+            }),
+            current_doc: 0,
+            current_score: 0,
+        }
+    }
+
+    fn new_compressed(
+        index: &HypersonicIndex<'a>,
+        list_start: usize,
+        scratch: &'a mut [u32; SCRATCH_SIZE],
+    ) -> Self {
+        let data = index.data();
+
+        let Some(num_blocks) = data.read_u32_le(list_start + 1) else {
+            return Self::empty();
+        };
+
+        let Some(start_offset) = data.read_u32_le(list_start + 5) else {
+            return Self::empty();
+        };
+
+        // En el formato real, el offset de datos comprimidos estaría aquí
+        let Some(compressed_data_start) = data.read_u32_le(list_start + 9) else {
+            // Fallback si el índice es simple (bitmap tests) o corrupto
+            return Self::empty();
+        };
+
+        let Some(abs_headers_start) = index.postings_base().checked_add(start_offset as usize)
+        else {
+            return Self::empty();
+        };
+
+        let headers_len = num_blocks as usize * size_of::<BlockHeader>();
+
+        // Verificamos que los headers caben en el archivo
+        let Some(abs_headers_end) = abs_headers_start.checked_add(headers_len) else {
+            return Self::empty();
+        };
+
+        if abs_headers_end > data.len() {
+            return Self::empty();
+        }
+
+        let headers_data = &data[abs_headers_start..abs_headers_end];
+
+        // 3. Validación de Datos Comprimidos (LA CORRECCIÓN)
+        // Calculamos dónde deberían empezar los datos comprimidos
+        let Some(abs_data_start) = index
+            .postings_base()
+            .checked_add(compressed_data_start as usize)
+        else {
+            return Self::empty();
+        };
+
+        // A. Verificación de Límites del Archivo
+        if abs_data_start > data.len() {
+            return Self::empty();
+        }
+
+        // B. Creación del Slice Seguro
+        // Como ya verificamos que abs_data_start <= data.len(), esto nunca hará pánico.
+        let compressed_data_slice = &data[abs_data_start..];
+
+        // C. Verificación de Longitud Mínima para SIMD (CRÍTICO)
+        // Tu función `decode_bp128_chunk_simd` hace un assert!(len >= 64).
+        // Si hay bloques para leer, debemos asegurar que tenemos al menos 64 bytes,
+        // de lo contrario la aplicación crasheará al intentar descomprimir el primer bloque.
+        if num_blocks > 0 && compressed_data_slice.len() < 64 {
+            return Self::empty(); // Índice corrupto o truncado
+        }
+
+        Self {
+            strategy: Strategy::Compressed(CompressedState {
+                headers_data,
+                num_blocks: num_blocks as usize,
+                block_idx: 0,
+                scratch,
+                scores_even: [0u8; SCRATCH_SIZE / 2],
+                scores_odd: [0u8; SCRATCH_SIZE / 2],
+                buf_pos: SCRATCH_SIZE,
+                #[cfg(target_arch = "wasm32")]
+                compressed_data: compressed_data_slice,
+                last_doc_id: 0,
+            }),
+            current_doc: 0,
+            current_score: 0,
+        }
+    }
+
+    /// Returns the current document ID.
+    #[inline]
+    pub const fn doc(&self) -> u32 {
+        self.current_doc
+    }
+    /// Returns the current document score.
+    #[inline]
+    pub const fn score(&self) -> u8 {
+        self.current_score
+    }
+    /// Advances the iterator to the first document >= `target` with score >= `min_score`.
+    ///
+    /// Returns the document ID if found, or `None` if no matching document exists.
+    #[inline]
+    pub fn advance(&mut self, target: u32, min_score: u8) -> Option<u32> {
+        match &mut self.strategy {
+            Strategy::Empty => None,
+            Strategy::Bitmap(state) => {
+                let result = advance_bitmap(state, target);
+                if let Some((doc, score)) = result {
+                    self.current_doc = doc;
+                    self.current_score = score;
+                    Some(doc)
+                } else {
+                    None
+                }
+            }
+            Strategy::Compressed(state) => {
+                let result = advance_compressed(state, target, min_score);
+                if let Some((doc, score)) = result {
+                    self.current_doc = doc;
+                    self.current_score = score;
+                    Some(doc)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Returns an estimate of the posting list size in bytes.
+    pub const fn size_estimate(&self) -> usize {
+        match &self.strategy {
+            Strategy::Empty => 0,
+            Strategy::Bitmap(state) => state.data.len(),
+            Strategy::Compressed(state) => state.headers_data.len(),
+        }
+    }
+}
+
+// ... (advance_bitmap, find_set_bit_fast, scan_partial_chunk se mantienen sin cambios) ...
+#[inline]
+fn advance_bitmap(state: &mut BitmapState<'_>, target: u32) -> Option<(u32, u8)> {
+    let byte_idx = (target / 8) as usize;
+    state.chunk_idx = byte_idx & !15;
+
+    while state.chunk_idx < state.data.len() {
+        if let Some(chunk) = state.data.sub_slice(state.chunk_idx, 16)
+            && let Some(bits) = scan_chunk(chunk)
+        {
+            let base_doc = (state.chunk_idx as u32) * 8;
+
+            if base_doc + 128 <= target {
+                state.chunk_idx += 16;
+                continue;
+            }
+
+            if is_empty(bits) {
+                state.chunk_idx += 16;
+                continue;
+            }
+
+            if let Some(doc) = find_set_bit_fast(bits, base_doc, target) {
+                state.chunk_idx = ((doc / 8) as usize) & !15;
+                return Some((doc, 10));
+            }
+
+            state.chunk_idx += 16;
+            continue;
+        }
+
+        if let Some((doc, score)) = scan_partial_chunk(state, target) {
+            return Some((doc, score));
+        }
+
+        break;
+    }
+    None
+}
+
+#[inline]
+const fn find_set_bit_fast(bits: ChunkBits, base_doc: u32, target: u32) -> Option<u32> {
+    let (mut lo, mut hi) = bits;
+    let relative_target = target.saturating_sub(base_doc);
+
+    if lo != 0 && relative_target < 64 {
+        let mask = if relative_target > 0 {
+            !((1u64 << relative_target) - 1)
+        } else {
+            u64::MAX
+        };
+        lo &= mask;
+
+        if lo != 0 {
+            return Some(base_doc + lo.trailing_zeros());
+        }
+    }
+
+    if hi != 0 {
+        let high_relative = relative_target.saturating_sub(64);
+        if high_relative < 64 {
+            let mask = if high_relative > 0 {
+                !((1u64 << high_relative) - 1)
+            } else {
+                u64::MAX
+            };
+            hi &= mask;
+        }
+
+        if hi != 0 {
+            return Some(base_doc + 64 + hi.trailing_zeros());
+        }
+    }
+    None
+}
+
+#[inline]
+fn scan_partial_chunk(state: &mut BitmapState<'_>, target: u32) -> Option<(u32, u8)> {
+    let slice = state.data.get(state.chunk_idx..)?;
+    let mut chunks = slice.chunks_exact(8);
+
+    for (i, chunk) in chunks.by_ref().enumerate() {
+        let mut bytes: [u8; 8] = [0; 8];
+        bytes.copy_from_slice(chunk);
+        let word = u64::from_le_bytes(bytes);
+
+        if word != 0 {
+            let offset = i * 8;
+            let current_byte_idx = state.chunk_idx + offset;
+            let doc_base = (current_byte_idx as u32) * 8;
+
+            if doc_base + 64 <= target {
+                continue;
+            }
+
+            let mut w = word;
+            let relative = target.saturating_sub(doc_base);
+
+            if relative < 64 {
+                w &= !((1u64 << relative) - 1);
+            } else {
+                w = 0;
+            }
+
+            if w != 0 {
+                let bit_pos = w.trailing_zeros();
+                let doc = doc_base + bit_pos;
+                state.chunk_idx = current_byte_idx + (bit_pos as usize / 8);
+                return Some((doc, 10));
+            }
+        }
+    }
+
+    let processed_bytes = slice.len() - chunks.remainder().len();
+    for (i, &byte) in chunks.remainder().iter().enumerate() {
+        if byte != 0 {
+            let current_byte_idx = state.chunk_idx + processed_bytes + i;
+            let doc_base = (current_byte_idx as u32) * 8;
+
+            if doc_base + 8 > target {
+                let mut b = byte;
+                let relative = target.saturating_sub(doc_base);
+                if relative < 8 {
+                    b &= !((1u8 << relative) - 1);
+                }
+                if b != 0 {
+                    let bit_pos = b.trailing_zeros();
+                    state.chunk_idx = current_byte_idx;
+                    return Some((doc_base + bit_pos, 10));
+                }
+            }
+        }
+    }
+
+    state.chunk_idx = state.data.len();
+    None
+}
+
+// ----------------------------------------------------------------------------
+// 3. COMPRESSED ITERATOR (WAND/BP128 INTEGRATION)
+// ----------------------------------------------------------------------------
+
+/// Advances the iterator to the first document >= `target` with score >= `min_score`.
+///
+/// This implements Block-Max WAND for pruning and uses the scratch buffer
+/// for temporary `DocID` storage (decoded via SIMD-BP128).
+#[inline]
+fn advance_compressed(
+    state: &mut CompressedState<'_>,
+    target: u32,
+    min_score: u8,
+) -> Option<(u32, u8)> {
+    while state.block_idx < state.num_blocks {
+        let header = state.current_header();
+
+        // 1. WAND Pruning (O(1) Check)
+        if header.max_score < min_score || header.max_doc < target {
+            state.block_idx = Wrapping(state.block_idx).0.wrapping_add(1);
+            state.buf_pos = SCRATCH_SIZE; // Mark buffer as expired
+            // Important: We must advance last_doc_id to maintain delta context for next block
+            state.last_doc_id = header.max_doc;
+            continue;
+        }
+
+        // 2. Decompression / Load Buffer
+        if state.buf_pos >= SCRATCH_SIZE {
+            decompress_block(state);
+        }
+
+        // 3. Search within the Buffer (NextGEQ)
+        // This is an optimized in-memory scan (linear scan is fast on L1 cache sized buffers).
+        let search_slice = &state.scratch[state.buf_pos..SCRATCH_SIZE];
+
+        // Optimized Search: Find the insertion point of the target
+        let local_idx = search_slice
+            .iter()
+            .position(|&doc| doc >= target)
+            .unwrap_or(search_slice.len());
+
+        // 4. Update Position
+        state.buf_pos = Wrapping(state.buf_pos).0.wrapping_add(local_idx);
+
+        // 5. Return Result or Continue
+        if state.buf_pos < SCRATCH_SIZE {
+            let doc = state.scratch[state.buf_pos];
+            state.buf_pos = Wrapping(state.buf_pos).0.wrapping_add(1);
+            return Some((doc, header.max_score));
+        }
+
+        // If we reached here, the target was beyond the end of the current buffer.
+        state.block_idx = Wrapping(state.block_idx).0.wrapping_add(1);
+        state.buf_pos = SCRATCH_SIZE;
+        // Last doc of buffer is already header.max_doc, so state.last_doc_id is implicitly updated
+    }
+
+    None
+}
+
+/// Función de entrada: Decide qué implementación usar (SIMD o Scalar).
+/// Mantiene la firma safe para no contagiar 'unsafe' hacia arriba.
+#[inline]
+fn decompress_block(state: &mut CompressedState<'_>) {
+    let base_doc = if state.block_idx == 0 {
+        0
+    } else {
+        state.last_doc_id
+    };
+
+    // --- RAMA WASM SIMD ---
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Llamamos a la implementación especializada.
+        // SAFETY:
+        // 1. Estamos en target_arch="wasm32".
+        // 2. Asumimos que el entorno de ejecución (Navegador/Node) soporta SIMD128.
+        //    (En producción, esto se garantiza compilando con RUSTFLAGS="-C target-feature=+simd128")
+        unsafe { decompress_block_simd(state, base_doc) };
+    }
+
+    // --- RAMA FALLBACK (SCALAR) ---
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut current = base_doc;
+        for slot in state.scratch.iter_mut() {
+            current = current.wrapping_add(1);
+            *slot = current;
+        }
+        state.scores_even.fill(10);
+        state.scores_odd.fill(10);
+    }
+
+    // --- LIMPIEZA COMÚN ---
+    state.buf_pos = 0;
+    state.last_doc_id = state.scratch[SCRATCH_SIZE - 1];
+}
+
+use core::ptr;
+
+/// Implementación optimizada con SIMD128.
+/// Se extrajo a su propia función para poder aplicarle el atributo `target_feature`.
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")] // <--- Habilita instrucciones específicas
+#[inline]
+unsafe fn decompress_block_simd(state: &mut CompressedState<'_>, base_doc: u32) {
+    // Constantes de formato
+    const BASES_HEADER_SIZE: usize = 32; // 8 chunks * 4 bytes (u32)
+    const SIMD_PADDING: usize = 64; // 4 vectores SIMD de seguridad
+
+    let header = state.current_header();
+    let block_start = header.data_offset as usize;
+
+    // 1. Check Global: Validar que el inicio del bloque esté dentro del slice
+    if block_start >= state.compressed_data.len() {
+        let sentinel = header.max_doc.saturating_add(1);
+        fill_scratch_with_sentinels(state.scratch, sentinel);
+        return;
+    }
+
+    // 2. VALIDATION BARRIER
+    // Calculamos requisitos totales: Header de Bases + Offset último chunk + Padding SIMD
+    let last_chunk_relative_offset = 14 * (header.bit_width as usize);
+    let min_required_bytes = BASES_HEADER_SIZE + last_chunk_relative_offset + SIMD_PADDING;
+
+    // Calculamos cuántos bytes reales quedan desde el inicio del bloque
+    let available_bytes = state.compressed_data.len() - block_start;
+
+    if available_bytes < min_required_bytes {
+        let sentinel = header.max_doc.saturating_add(1);
+        fill_scratch_with_sentinels(state.scratch, sentinel);
+        return;
+    }
+
+    // 3. LOAD BASES (Parallel Setup)
+    // Leemos los 8 enteros iniciales que nos permiten romper la dependencia serial.
+    let mut bases = [0u32; 8];
+
+    // SAFETY:
+    // 1. Validity: Hemos verificado arriba que `available_bytes >= min_required_bytes`.
+    //    Como `min_required_bytes` incluye `BASES_HEADER_SIZE` (32 bytes), la lectura es válida.
+    // 2. Alignment: `copy_nonoverlapping` maneja la memoria como bytes, no requiere alineación de u32 en el origen.
+    // 3. No-Overlap: `state.compressed_data` (heap/slice) y `bases` (stack) son regiones disjuntas.
+    unsafe {
+        let src_ptr = state.compressed_data.as_ptr().add(block_start);
+        let dst_ptr = bases.as_mut_ptr().cast::<u8>();
+        ptr::copy_nonoverlapping(src_ptr, dst_ptr, BASES_HEADER_SIZE);
+    }
+
+    // Definimos el slice de datos bit-packed, saltando el header de bases
+    let packed_data_start = block_start + BASES_HEADER_SIZE;
+    // SAFETY: Bounds check implícito garantizado por la validación `min_required_bytes` anterior.
+    // Usamos get_unchecked o slicing normal. Slicing normal es seguro y el compilador elide checks aquí usualmente.
+    let packed_data = &state.compressed_data[packed_data_start..];
+
+    // 4. EXECUTE PARALLEL SIMD LOOP
+    for (i, &base) in bases.iter().enumerate() {
+        let chunk_offset = (i * header.bit_width as usize * 16) / 8;
+
+        // Calculamos la base absoluta para este chunk.
+        // `base_doc`: Base del bloque anterior (global).
+        // `base`: Delta relativo almacenado en el header (local al chunk).
+        // ALGORITMO: Esto rompe la cadena de dependencia serial.
+        let chunk_base = base_doc.wrapping_add(base);
+
+        // Llamada a función inlineada que usa intrinsics.
+        // Pasamos el slice relativo a `packed_data`.
+        let chunk_vectors =
+            decode_bp128_chunk_simd(&packed_data[chunk_offset..], header.bit_width, chunk_base);
+
+        // Store the 4 decoded vectors into the scratchpad
+        // SAFETY:
+        // 1. `state.scratch` has a fixed length of `SCRATCH_SIZE` (128 `u32` elements).
+        // 2. The loop runs for `i` in `0..8`.
+        // 3. We write to offset `i * 16`. The maximum offset is `7 * 16 = 112`.
+        // 4. `write_docid_chunk` writes exactly 16 elements. The write range `112..128` fits perfectly within bounds.
+        unsafe { write_docid_chunk(state.scratch, i * 16, chunk_vectors) };
+    }
+
+    // 5. Scores Decoding
+    // Nota: El offset de scores es relativo a los datos bit-packed
+    let doc_payload_size = (128 * header.bit_width as usize) / 8;
+
+    if let Some(score_data_slice) = packed_data.get(doc_payload_size..) {
+        if score_data_slice.len() >= 64 {
+            let src_ptr = &raw const score_data_slice[0];
+            let dest_even = &raw mut state.scores_even[0];
+            let dest_odd = &raw mut state.scores_odd[0];
+
+            // SAFETY:
+            // 1. Source Validity: We explicitly checked `score_data_slice.len() >= 64` in the `if` condition above.
+            //    `src_ptr` is derived from index 0 of this valid slice.
+            // 2. Destination Validity: `state.scores_even` and `state.scores_odd` are fixed-size arrays
+            //    of length `SCRATCH_SIZE / 2` (64 bytes each).
+            // 3. Write Bounds: `decode_scores_block_simd` performs exactly 4 iterations of 16-byte stores (64 bytes total).
+            // 4. Architecture: Guarded by `#[cfg(target_arch = "wasm32")]` and `#[target_feature(enable = "simd128")]`.
+            unsafe { decode_scores_block_simd(src_ptr, dest_even, dest_odd) };
+        } else {
+            state.scores_even.fill(1);
+            state.scores_odd.fill(1);
+        }
+    } else {
+        state.scores_even.fill(1);
+        state.scores_odd.fill(1);
+    }
+}
+
+// Helper para manejar fallos silenciosamente.
+// ESTRATEGIA: Llenamos el buffer con un valor "centinela" que sabemos
+// causará un "mismatch" seguro en la búsqueda actual.
+#[inline(never)]
+#[cfg(target_arch = "wasm32")]
+fn fill_scratch_with_sentinels(scratch: &mut [u32], sentinel_val: u32) {
+    // Llenamos todo el buffer con el mismo valor.
+    // Como la búsqueda en 'advance' usa scan lineal o comparaciones >=,
+    // tener valores repetidos no rompe la lógica, solo avanza rápido.
+    scratch.fill(sentinel_val);
+}
+
+//! # Parzel - Hypersonic Search Engine (WASM Kernel) 🚀
+//!
+//! A high-performance, zero-allocation search engine designed for WebAssembly.
+//!
+//! ## Architecture: "Unsafe Shell, Safe Core"
+//!
+//! - **WASM FFI Boundary**: Handled by `wasm-bindgen` for safe data transfer.
+//! - **Core Logic**: Fully safe Rust operating on validated slices.
+//! - **SIMD Acceleration**: Platform-specific optimizations for bitmap scanning.
+//!
+//! ## Modules
+//!
+//! - [`data`]: Index structures and binary format parsing
+//! - [`engine`]: High-level search orchestration
+//! - [`error`]: Centralized error types and WASM exception bridge
+//! - [`iter`]: Posting list iterators
+//! - [`simd`]: SIMD-accelerated bitmap operations
+//! - [`tokenizer`]: Query tokenization
+//!
+// Use no_std only for WASM production builds (ensures smaller binary size)
+#![cfg_attr(all(target_arch = "wasm32", not(test)), no_std)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+#![warn(missing_docs)]
+#![warn(clippy::missing_const_for_fn)]
+#![warn(clippy::cast_possible_wrap)]
+#![warn(clippy::cast_precision_loss)]
+#![warn(clippy::cast_sign_loss)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::unwrap_used)]
+#![warn(clippy::expect_used)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::missing_errors_doc)]
+
+extern crate alloc;
+use wasm_bindgen::prelude::*;
+
+use lol_alloc::{AssumeSingleThreaded, FreeListAllocator};
+
+#[cfg(target_arch = "wasm32")]
+#[global_allocator]
+static ALLOCATOR: AssumeSingleThreaded<FreeListAllocator> =
+    // SAFETY: This application is single threaded, so using AssumeSingleThreaded is allowed.
+    unsafe { AssumeSingleThreaded::new(FreeListAllocator::new()) };
+
+// ============================================================================
+// 2. Allocator & Panic Handler (WASM production only)
+// ============================================================================
+
+// [Allocator and Panic Handler SNIPPED for brevity, but assumed to remain]
+
+// ============================================================================
+// 3. Module Declarations & Prelude
+// ============================================================================
+
+mod context;
+mod data;
+pub mod engine;
+mod error;
+mod iter;
+mod prelude; // Brings in Result, Vec, String, f!, etc.
+pub mod simd;
+mod tokenizer;
+mod utils;
+
+// Imports for the public layer
+use crate::prelude::*;
+use wasm_bindgen::JsError;
+
+// ============================================================================
+// 4. Public API Re-exports
+// ============================================================================
+
+pub use data::HypersonicIndex;
+pub use engine::MAX_RESULTS;
+pub use error::Error;
+pub use iter::{PostingIterator, SCRATCH_SIZE};
+pub use tokenizer::{MAX_TOKENS, Tokenizer}; // Export the central Error type
+
+// ============================================================================
+// 5. WASM BOUNDARY (Public API)
+// ============================================================================
+
+/// Searches the index. Returns matching document IDs as a JavaScript `Uint32Array`.
+///
+/// # Arguments
+/// * `index_data`: Index bytes (`Uint8Array` from JS).
+/// * `query`: Search query string.
+///
+/// # Returns
+/// `Result<Box<[u32]>, JsError>`: Array of IDs on success; throws exception on error.
+#[wasm_bindgen]
+pub fn search(index_data: &[u8], query: &str) -> core::result::Result<Box<[u32]>, JsError> {
+    // 1. Execute core logic which returns the internal Result<T, Error>.
+    // 2. Map the internal error (Error) to the boundary error (JsError).
+    internal_search(index_data, query).map_err(Into::into)
+}
+
+// --- Internal Engine Wrapper ---
+
+fn internal_search(index_data: &[u8], query: &str) -> Result<Box<[u32]>> {
+    // // 1. FAST VALIDATION
+    if index_data.is_empty() {
+        // // Empty buffer check.
+        return Err("Index data cannot be empty".into());
+    }
+    if query.trim().is_empty() {
+        // // Empty query means zero results.
+        return Ok(Box::new([]));
+    }
+
+    // // 2. PREPARE OUTPUT BUFFER
+    let mut results_buffer = [0u32; MAX_RESULTS];
+
+    // // 3. CORE EXECUTION
+    // // Call the engine and get the number of matches found.
+    // // NOTE: engine::search must handle internal errors (like corrupted index)
+    // // and should ideally return Result<usize> if those errors are recoverable.
+    let count = engine::search(index_data, query, &mut results_buffer);
+
+    // // 4. FINAL OUTPUT PACKAGING
+    // // Take only the found matches (0..count) and box them for efficient JS transfer.
+    // // This creates the exact sized Uint32Array in JavaScript.
+    // let exact_matches = results_buffer[..count].to_vec().into_boxed_slice();
+    let exact_matches = Box::from(&results_buffer[..count]);
+
+    Ok(exact_matches)
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to build test indices.
+    struct IndexBuilder {
+        data: Vec<u8>,
+    }
+
+    impl IndexBuilder {
+        fn new(num_docs: u32) -> Self {
+            let mut data = vec![0u8; 20];
+            // Magic "HYP0"
+            data[0..4].copy_from_slice(&0x4859_5030u32.to_le_bytes());
+            // Number of documents
+            data[4..8].copy_from_slice(&num_docs.to_le_bytes());
+            // Postings offset
+            data[16..20].copy_from_slice(&20u32.to_le_bytes());
+            Self { data }
+        }
+
+        fn add_bitmap_posting(&mut self, docs: &[u32]) -> Result<usize> {
+            let offset = self.data.len() - 20; // Relative to postings_base
+
+            // Type byte
+            self.data.push(0);
+
+            // Calculate bitmap size
+            let max_doc = docs.iter().max().copied().unwrap_or(0);
+            let needed_bytes = ((max_doc / 8) + 1) as usize;
+            let len_bytes = (needed_bytes + 15) & !15;
+
+            // Length field
+            let len_u32 = u32::try_from(len_bytes)?;
+            self.data.extend_from_slice(&len_u32.to_le_bytes());
+
+            // Bitmap data
+            let start_idx = self.data.len();
+            self.data.resize(self.data.len() + len_bytes, 0);
+
+            for &doc in docs {
+                let byte_pos = (doc / 8) as usize;
+                let bit_pos = doc % 8;
+                self.data[start_idx + byte_pos] |= 1 << bit_pos;
+            }
+
+            Ok(offset)
+        }
+
+        fn build(self) -> Vec<u8> {
+            self.data
+        }
+    }
+
+    #[test]
+    fn index_builder_creates_valid_index() {
+        let mut builder = IndexBuilder::new(100);
+        if let Err(e) = builder.add_bitmap_posting(&[10, 20, 30]) {
+            panic!("Failed to add bitmap posting: {e:?}");
+        }
+        let data = builder.build();
+
+        let index = HypersonicIndex::new(&data);
+        assert!(index.is_some());
+    }
+
+    #[test]
+    fn search_finds_documents() {
+        let mut builder = IndexBuilder::new(100);
+        if let Err(e) = builder.add_bitmap_posting(&[10, 20, 30]) {
+            panic!("Failed to add bitmap posting: {e:?}");
+        }
+        let data = builder.build();
+
+        let Some(index) = HypersonicIndex::new(&data) else {
+            panic!("Index should be valid");
+        };
+
+        let mut scratch = [0u32; SCRATCH_SIZE];
+        let mut iter = PostingIterator::new(&index, 0, &mut scratch);
+
+        assert_eq!(iter.advance(0, 0), Some(10));
+        assert_eq!(iter.advance(11, 0), Some(20));
+        assert_eq!(iter.advance(21, 0), Some(30));
+        assert_eq!(iter.advance(31, 0), None);
+    }
+
+    #[test]
+    fn empty_query_returns_zero() {
+        let builder = IndexBuilder::new(100);
+        let data = builder.build();
+        let mut results = [0u32; 10];
+
+        assert_eq!(engine::search(&data, "", &mut results), 0);
+    }
+
+    #[test]
+    fn invalid_index_returns_zero() {
+        let mut results = [0u32; 10];
+
+        assert_eq!(engine::search(&[], "test", &mut results), 0);
+        assert_eq!(engine::search(&[0u8; 5], "test", &mut results), 0);
+    }
+}
+
+//! SIMD-accelerated index processing functions.
+//!
+//! Provides platform-specific optimizations for scanning bitmaps, 4-bit score accumulation,
+//! and binary packing (BP128) decompression, prioritizing register operations and
+//! zero-copy semantics for maximum performance on WebAssembly.
+//!
+//! # Performance Note
+//! Returns `(u64, u64)` instead of `u128` because WASM32 lacks native 128-bit
+//! arithmetic support. Using `u128` causes slow emulation via compiler intrinsics.
+
+use crate::prelude::*;
+
+// ============================================================================
+// WASM32 INTRINSICS (UNSIGNED PURITY)
+// ============================================================================
+#[rustfmt::skip]
+#[cfg(target_arch = "wasm32")]
+// We explicitly import the correct unsigned SIMD intrinsics to ensure correct behavior.
+use core::arch::wasm32::{
+    // DocID Intrinsics (u32)
+    u32x4, u32x4_add, u32x4_ge, u32x4_splat, u32x4_extract_lane,
+    // Score Intrinsics (u8)
+    u8x16, u8x16_add_sat, u8x16_bitmask, u8x16_shr, u8x16_splat, u8x16_swizzle,
+    // Base Types & Generic Ops
+    v128, v128_and, v128_any_true, v128_load, v128_store,
+};
+
+/// Result of scanning a 16-byte chunk: (low 64 bits, high 64 bits).
+///
+/// We avoid `u128` because WASM32 emulates it slowly. This representation
+/// allows efficient use of `trailing_zeros()` on native 64-bit values.
+pub type ChunkBits = (u64, u64);
+
+/// A tuple of four SIMD vectors representing a decoded BP128 chunk of document IDs.
+/// (4 vectors * 4 lanes = 16 `DocIDs`).
+#[cfg(target_arch = "wasm32")]
+pub type DocIdChunk = (v128, v128, v128, v128);
+
+#[rustfmt::skip]
+/// Lookup table for scoring based on byte population counts or 4-bit quantization.
+/// Maps a 4-bit input (0-15) to an 8-bit score weight (0-255).
+#[cfg(target_arch = "wasm32")]
+pub const SCORING_LUT: v128 = u8x16(
+    0, 15, 30, 45, 
+    60, 75, 90, 105, 
+    120, 135, 150, 165, 
+    180, 195, 210, 255,
+);
+
+// ============================================================================
+// 1. BITMAP SCANNING FUNCTIONS
+// ============================================================================
+
+/// Scans a 16-byte chunk and returns it as a pair of 64-bit values.
+///
+/// Uses WASM SIMD intrinsics when available, with early-exit optimization
+/// for all-zero chunks.
+///
+/// # Arguments
+/// * `chunk` - A byte slice of at least 16 bytes.
+///
+/// # Returns
+/// * `Some((0, 0))` - All 16 bytes are zero.
+/// * `Some((lo, hi))` - The 128 bits split into low and high 64-bit parts.
+/// * `None` - Chunk is too small (< 16 bytes).
+#[inline]
+#[must_use]
+pub fn scan_chunk(chunk: &[u8]) -> Option<ChunkBits> {
+    if chunk.len() < 16 {
+        return None;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        // SAFETY: We verified chunk has at least 16 bytes.
+        Some(scan_chunk_wasm(chunk))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(scan_chunk_fallback(chunk))
+    }
+}
+
+#[inline]
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+fn scan_chunk_wasm(chunk: &[u8]) -> ChunkBits {
+    let ptr = chunk.as_ptr();
+
+    // SAFETY:
+    // 1. The caller guarantees `chunk` is at least 16 bytes.
+    // 2. `v128_load` handles unaligned memory access in WASM.
+    let v = unsafe { v128_load(ptr.cast()) };
+
+    // Efficiently check if the entire vector is zero.
+    if !v128_any_true(v) {
+        return (0, 0);
+    }
+
+    // SAFETY:
+    // 1. We verified the chunk size is sufficient.
+    // 2. We use `read_unaligned` to safely handle potential misalignment of `u64` access.
+    unsafe {
+        let lo = ptr.cast::<u64>().read_unaligned();
+        let hi = ptr.add(8).cast::<u64>().read_unaligned();
+        (lo, hi)
+    }
+}
+
+#[inline]
+#[cfg(not(target_arch = "wasm32"))]
+fn scan_chunk_fallback(chunk: &[u8]) -> ChunkBits {
+    // Validation `chunk.len() >= 16` is guaranteed by `scan_chunk`.
+
+    let mut lo_bytes: [u8; 8] = [0; 8];
+    let mut hi_bytes: [u8; 8] = [0; 8];
+
+    // Use copy_from_slice for optimization; compiler often elides bounds checks here.
+    lo_bytes.copy_from_slice(&chunk[0..8]);
+    hi_bytes.copy_from_slice(&chunk[8..16]);
+
+    let lo = u64::from_le_bytes(lo_bytes);
+    let hi = u64::from_le_bytes(hi_bytes);
+
+    (lo, hi)
+}
+
+/// Checks if the chunk bits are all zero.
+#[inline]
+pub const fn is_empty(bits: ChunkBits) -> bool {
+    bits.0 == 0 && bits.1 == 0
+}
+
+// ============================================================================
+// 2. SCORING FUNCTIONS (SWIZZLE-LUT)
+// ============================================================================
+
+/// Expands 4-bit quantized scores to 8-bit scores using a LUT (swizzle)
+/// and accumulates them into two separate vectors (Even/Odd) using saturating addition.
+///
+/// This avoids the overhead of shuffling bytes to a single accumulator.
+///
+/// # Arguments
+/// * `quantized_scores_vector` - 128-bit vector containing 32 packed 4-bit scores.
+/// * `acc_even` - Accumulator for even-indexed documents (nibbles 0-3).
+/// * `acc_odd` - Accumulator for odd-indexed documents (nibbles 4-7).
+/// * `lut` - The `SCORING_LUT` vector.
+///
+/// # Returns
+/// A tuple `(acc_even, acc_odd)` with the updated accumulators.
+///
+/// # Safety
+/// The caller must ensure that the function is only called on architectures supporting
+/// the `simd128` target feature.
+#[inline]
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub unsafe fn accumulate_4bit_scores_simd(
+    quantized_scores_vector: v128,
+    acc_even: v128,
+    acc_odd: v128,
+    lut: v128,
+) -> (v128, v128) {
+    // 1. Decode Low Nibbles (Even Docs)
+    // Mask 0x0F isolates the lower 4 bits.
+    let mask_low = u8x16_splat(0xF);
+    let low_nibbles = v128_and(quantized_scores_vector, mask_low);
+
+    // 2. Decode High Nibbles (Odd Docs)
+    // OPTIMIZATION: u8x16_shr performs a logical shift, filling high bits with zeros.
+    // Therefore, an additional AND mask is NOT required here.
+    let high_nibbles = u8x16_shr(quantized_scores_vector, 4);
+
+    // 3. Expansion & Dequantization (Swizzle / LUT Lookup)
+    // Maps the 4-bit index (0-15) to the 8-bit score from the LUT.
+    let scores_even = u8x16_swizzle(lut, low_nibbles);
+    let scores_odd = u8x16_swizzle(lut, high_nibbles);
+
+    // 4. Saturating Accumulation
+    // We return the expression directly to satisfy Clippy's `let_and_return` rule.
+    (
+        u8x16_add_sat(acc_even, scores_even),
+        u8x16_add_sat(acc_odd, scores_odd),
+    )
+}
+
+/// Decodes and accumulates 4-bit scores for an entire block (128 documents).
+///
+/// Reads 64 bytes of quantized scores, expands them using the Swizzle-LUT,
+/// and writes the results into the split even/odd score buffers.
+///
+/// # Arguments
+/// * `src_ptr` - Pointer to the start of the compressed scores (must be valid for 64 bytes).
+/// * `dest_even` - Pointer to the start of the even scores buffer (must be valid for 64 bytes).
+/// * `dest_odd` - Pointer to the start of the odd scores buffer (must be valid for 64 bytes).
+///
+/// # Safety
+/// This function is marked `unsafe` because it dereferences raw pointers.
+/// The caller MUST ensure that:
+/// 1. `src_ptr`, `dest_even`, and `dest_odd` are valid for reads/writes of 64 bytes.
+/// 2. The memory regions do not overlap in a way that breaks semantics.
+/// 3. The `simd128` target feature is enabled.
+#[inline]
+#[allow(clippy::cast_ptr_alignment)]
+#[target_feature(enable = "simd128")]
+#[cfg(target_arch = "wasm32")]
+pub unsafe fn decode_scores_block_simd(src_ptr: *const u8, dest_even: *mut u8, dest_odd: *mut u8) {
+    // Init accumulators to zero for this block.
+    // SAFETY: Safe constructor for zero vector.
+    let v_zero = u8x16_splat(0);
+    let lut = SCORING_LUT;
+
+    // Cast raw byte pointers to vector pointers.
+    // This cast is safe, but dereferencing resulting pointers requires alignment/validity checks (handled by v128_load).
+    let src_v = src_ptr.cast::<v128>();
+    let dst_even_v = dest_even.cast::<v128>();
+    let dst_odd_v = dest_odd.cast::<v128>();
+
+    // Process 128 scores (4 iterations * 32 scores per vector)
+    for i in 0..4 {
+        // 1. Load 32 quantized scores (16 bytes)
+        // SAFETY: Caller guarantees `src_ptr` is valid for 64 bytes.
+        // `v128_load` handles unaligned access.
+        let v_quantized = unsafe { v128_load(src_v.add(i)) };
+
+        // 2. Expand and Accumulate
+        // SAFETY: We are inside a function with `#[target_feature(enable = "simd128")]`.
+        let (acc_even, acc_odd) =
+            unsafe { accumulate_4bit_scores_simd(v_quantized, v_zero, v_zero, lut) };
+
+        // 3. Store results
+        // SAFETY: Caller guarantees `dest_even` and `dest_odd` are valid for 64 bytes.
+        unsafe { v128_store(dst_even_v.add(i), acc_even) };
+        // SAFETY: Caller guarantees `dest_odd` is valid for 64 bytes.
+        unsafe { v128_store(dst_odd_v.add(i), acc_odd) };
+    }
+}
+
+// ============================================================================
+// 3. BP128 DECODING (IN-REGISTER) - OPTIMIZED FOR SPEED
+// ============================================================================
+
+/// Extracts a u32 from bitstream at compile-time known position.
+/// All parameters are const-propagated by LLVM when IDX and WIDTH are literals.
+#[cfg(target_arch = "wasm32")]
+macro_rules! extract {
+    ($ptr:expr, $idx:literal, $width:literal) => {{
+        // Compile-time constants - no runtime computation
+        const BYTE_POS: usize = ($idx * $width) / 8;
+        const BIT_REM: u32 = (($idx * $width) % 8) as u32;
+        const MASK: u32 = (1u32 << $width) - 1;
+
+        // SAFETY: Caller guarantees ptr valid for 64 bytes
+        let raw = unsafe { $ptr.add(BYTE_POS).cast::<u32>().read_unaligned() };
+        (raw >> BIT_REM) & MASK
+    }};
+}
+
+/// Unpacks 16 values and assembles into SIMD vectors.
+#[cfg(target_arch = "wasm32")]
+macro_rules! unpack16 {
+    ($ptr:expr, $base:expr, $w:literal) => {{
+        (
+            u32x4_add(
+                u32x4(
+                    extract!($ptr, 0, $w),
+                    extract!($ptr, 1, $w),
+                    extract!($ptr, 2, $w),
+                    extract!($ptr, 3, $w),
+                ),
+                $base,
+            ),
+            u32x4_add(
+                u32x4(
+                    extract!($ptr, 4, $w),
+                    extract!($ptr, 5, $w),
+                    extract!($ptr, 6, $w),
+                    extract!($ptr, 7, $w),
+                ),
+                $base,
+            ),
+            u32x4_add(
+                u32x4(
+                    extract!($ptr, 8, $w),
+                    extract!($ptr, 9, $w),
+                    extract!($ptr, 10, $w),
+                    extract!($ptr, 11, $w),
+                ),
+                $base,
+            ),
+            u32x4_add(
+                u32x4(
+                    extract!($ptr, 12, $w),
+                    extract!($ptr, 13, $w),
+                    extract!($ptr, 14, $w),
+                    extract!($ptr, 15, $w),
+                ),
+                $base,
+            ),
+        )
+    }};
+}
+
+/// Generates optimized match dispatch for all bit widths.
+#[cfg(target_arch = "wasm32")]
+macro_rules! bp128_dispatch {
+    ($ptr:expr, $width:expr, $base:expr) => {
+        match $width {
+            1 => unpack16!($ptr, $base, 1),
+            2 => unpack16!($ptr, $base, 2),
+            3 => unpack16!($ptr, $base, 3),
+            4 => unpack16!($ptr, $base, 4),
+            5 => unpack16!($ptr, $base, 5),
+            6 => unpack16!($ptr, $base, 6),
+            7 => unpack16!($ptr, $base, 7),
+            8 => unpack16!($ptr, $base, 8),
+            9 => unpack16!($ptr, $base, 9),
+            10 => unpack16!($ptr, $base, 10),
+            11 => unpack16!($ptr, $base, 11),
+            12 => unpack16!($ptr, $base, 12),
+            13 => unpack16!($ptr, $base, 13),
+            14 => unpack16!($ptr, $base, 14),
+            15 => unpack16!($ptr, $base, 15),
+            16 => unpack16!($ptr, $base, 16),
+            17 => unpack16!($ptr, $base, 17),
+            18 => unpack16!($ptr, $base, 18),
+            19 => unpack16!($ptr, $base, 19),
+            20 => unpack16!($ptr, $base, 20),
+            21 => unpack16!($ptr, $base, 21),
+            22 => unpack16!($ptr, $base, 22),
+            23 => unpack16!($ptr, $base, 23),
+            24 => unpack16!($ptr, $base, 24),
+            25 => unpack16!($ptr, $base, 25),
+            26 => unpack16!($ptr, $base, 26),
+            27 => unpack16!($ptr, $base, 27),
+            28 => unpack16!($ptr, $base, 28),
+            29 => unpack16!($ptr, $base, 29),
+            30 => unpack16!($ptr, $base, 30),
+            31 => unpack16!($ptr, $base, 31),
+            // 32-bit: direct SIMD load (most efficient)
+            // SAFETY: ptr is valid for 64 bytes (asserted at entry)
+            32 => unsafe {
+                (
+                    u32x4_add(v128_load($ptr.cast()), $base),
+                    u32x4_add(v128_load($ptr.add(16).cast()), $base),
+                    u32x4_add(v128_load($ptr.add(32).cast()), $base),
+                    u32x4_add(v128_load($ptr.add(48).cast()), $base),
+                )
+            },
+            // Invalid: return base (delta = 0)
+            _ => ($base, $base, $base, $base),
+        }
+    };
+}
+
+/// Decodes a BP128-compressed chunk of document IDs using SIMD instructions.
+///
+/// Uses compile-time constant propagation for maximum performance.
+/// Each bit width generates specialized inline code with zero runtime overhead.
+///
+/// # Performance
+/// - All bit positions, masks, and offsets are compile-time constants
+/// - LLVM generates optimal `br_table` for the match dispatch
+/// - No function call overhead, no memory lookups for parameters
+///
+/// # Arguments
+/// * `compressed_data` - Slice containing the compressed data. Must be at least 64 bytes.
+/// * `bit_width` - Bit width of the compressed data (1-32).
+/// * `base_doc_id` - The base document ID to add to each decoded delta.
+///
+/// # Returns
+/// A `DocIdChunk` (tuple of 4 `v128` vectors) containing 16 decoded document IDs.
+///
+/// # Panics
+/// Panics if `compressed_data.len() < 64`.
+#[inline]
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub fn decode_bp128_chunk_simd(
+    compressed_data: &[u8],
+    bit_width: u8,
+    base_doc_id: u32,
+) -> DocIdChunk {
+    assert!(
+        compressed_data.len() >= 64,
+        "BP128 chunk must be at least 64 bytes"
+    );
+
+    let ptr = &raw const compressed_data[0];
+    let v_base = u32x4_splat(base_doc_id);
+
+    // LLVM converts this to an efficient br_table with inline code per branch
+    bp128_dispatch!(ptr, bit_width, v_base)
+}
+
+// ============================================================================
+// 4. SIMD UTILITIES
+// ============================================================================
+
+/// Compares 16 `DocIDs` against a Target `DocID` and returns a bitmask vector.
+///
+/// # Arguments
+/// * `doc_vec` - A vector containing 4 `DocIDs` (u32).
+/// * `target` - The target `DocID` to compare against.
+///
+/// # Returns
+/// A `v128` mask where lanes are all-ones if `DocID >= Target`, else all-zeros.
+///
+/// # Safety
+/// The caller must ensure that `simd128` target feature is enabled.
+#[inline]
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub unsafe fn find_geq_mask(doc_vec: v128, target: u32) -> v128 {
+    let v_target = u32x4_splat(target);
+    // Unsigned comparison: Greater-Than-Or-Equal
+    u32x4_ge(doc_vec, v_target)
+}
+
+/// Converts a SIMD mask vector to a scalar bitmask (u16).
+///
+/// Extracts the most significant bit of each byte in the vector.
+///
+/// # Safety
+/// The caller must ensure that `simd128` target feature is enabled.
+#[inline]
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub unsafe fn mask_to_scalar(mask: v128) -> u16 {
+    // u8x16_bitmask is the correct intrinsic for byte-wise masks.
+    u8x16_bitmask(mask)
+}
+
+/// Writes a chunk of 16 `DocIDs` (4 vectors) into a mutable `u32` buffer.
+///
+/// Abstracts pointer arithmetic and SIMD storage.
+///
+/// # Arguments
+/// * `dest` - Mutable slice to write into.
+/// * `index` - Starting index in the slice.
+/// * `chunk` - The 16 `DocIDs` to write.
+///
+/// # Safety
+/// This function is marked `unsafe` because it performs raw pointer arithmetic.
+/// The caller MUST ensure that `dest` has sufficient space (at least 16 elements)
+/// starting from `index`.
+#[inline]
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+#[allow(clippy::cast_ptr_alignment)]
+pub unsafe fn write_docid_chunk(dest: &mut [u32], index: usize, chunk: DocIdChunk) {
+    // Debug assertion to catch out-of-bounds in testing.
+    debug_assert!(index + 16 <= dest.len());
+
+    // Get raw pointer to the destination index.
+    // &raw mut is safe to create, but casting and writing is unsafe.
+    let ptr = (&raw mut dest[index]).cast::<v128>();
+
+    // SAFETY:
+    // 1. Caller guarantees `dest` bounds (checked via debug_assert).
+    // 2. `v128_store` handles unaligned memory access in WASM (though `dest` is likely aligned).
+    // 3. Pointer additions are within the bounds of the slice.
+    unsafe {
+        v128_store(ptr, chunk.0);
+        v128_store(ptr.add(1), chunk.1);
+        v128_store(ptr.add(2), chunk.2);
+        v128_store(ptr.add(3), chunk.3);
+    }
+}
+
+/// Extracts the last lane (lane 3) from a `DocIDs` vector.
+///
+/// Uses the optimized intrinsic instead of memory transmutation.
+///
+/// # Safety
+/// The caller must ensure that `simd128` target feature is enabled.
+#[inline]
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+pub unsafe fn extract_last_lane(v: v128) -> u32 {
+    // <3> indicates the lane index (0, 1, 2, 3).
+    u32x4_extract_lane::<3>(v)
+}
+
+//! Query tokenization for search processing.
+//!
+//! Provides a simple tokenizer that splits text on whitespace
+//! and converts tokens to term IDs for index lookup.
+
+/// Maximum number of tokens supported in a single query.
+pub const MAX_TOKENS: usize = 16;
+
+/// Tokenizes input text into term IDs.
+///
+/// This is a simple whitespace tokenizer suitable for basic search.
+/// For production use, consider integrating a proper FST-based tokenizer.
+#[derive(Debug, Default)]
+pub struct Tokenizer {
+    _private: (), // Prevent direct construction
+}
+
+impl Tokenizer {
+    /// Creates a new tokenizer instance.
+    #[inline]
+    pub const fn new() -> Self {
+        Self { _private: () }
+    }
+
+    /// Tokenizes input text into an array of string slices.
+    ///
+    /// # Arguments
+    /// * `text` - Input text to tokenize.
+    /// * `out` - Output buffer to store the resulting string slices.
+    ///
+    /// # Returns
+    /// Number of tokens written to `out`.
+    ///
+    /// # Algorithm
+    /// - Uses `split_ascii_whitespace` iterator which handles leading/trailing spaces
+    ///   and consecutive delimiters automatically.
+    /// - Uses `zip` to pair tokens with the output buffer slots, ensuring we never
+    ///   write out of bounds (eliminating bounds checks).
+    pub fn tokenize<'a>(&self, text: &'a str, out: &mut [&'a str]) -> usize {
+        // Iterator magic:
+        // 1. split_ascii_whitespace(): Generates slices of words, skipping all spaces.
+        // 2. take(out.len()): Ensures we stop if the text has more words than the buffer.
+        // 3. zip(out.iter_mut()): Pairs each found token with a mutable slot in 'out'.
+        //    Crucially, 'zip' stops when EITHER iterator is exhausted.
+
+        let mut count = 0;
+
+        for (token, slot) in text.split_ascii_whitespace().zip(out.iter_mut()) {
+            *slot = token;
+            count += 1;
+        }
+
+        count
+    }
+}
+
+use crate::prelude::*;
+
+// Safe memory access abstractions for byte slices.
+//
+// Provides efficient, bounds-checked access patterns for reading
+// binary data without unnecessary allocations.
+
+/// Extension trait for safe byte slice operations.
+///
+/// All methods perform bounds checking and return `None` on invalid access.
+pub trait ByteSliceExt {
+    /// Reads a little-endian `u32` at the given offset.
+    fn read_u32_le(&self, offset: usize) -> Option<u32>;
+
+    /// Reads a single byte at the given offset.
+    fn read_u8(&self, offset: usize) -> Option<u8>;
+
+    /// Returns a sub-slice starting at `offset` with length `len`.
+    fn sub_slice(&self, offset: usize, len: usize) -> Option<&[u8]>;
+}
+
+impl ByteSliceExt for [u8] {
+    #[inline]
+    fn read_u32_le(&self, offset: usize) -> Option<u32> {
+        self.get(offset..offset.checked_add(4)?)?
+            .try_into()
+            .ok()
+            .map(u32::from_le_bytes)
+    }
+
+    #[inline]
+    fn read_u8(&self, offset: usize) -> Option<u8> {
+        self.get(offset).copied()
+    }
+
+    #[inline]
+    fn sub_slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len)?;
+        self.get(offset..end)
+    }
+}

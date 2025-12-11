@@ -1,0 +1,8 @@
+{
+    // Hacer que rust-analyzer piense en wasm32
+    "rust-analyzer.cargo.target": "wasm32-unknown-unknown",
+    // Para que el `cargo check` que corre rust-analyzer también apunte a wasm
+    "rust-analyzer.check.targets": [
+        "wasm32-unknown-unknown"
+    ]
+}
