@@ -1,0 +1,105 @@
+Aquí tienes el documento técnico maestro, completo y actualizado, consolidando todas las investigaciones, algoritmos base, variantes avanzadas y estrategias híbridas discutidas.
+
+---
+
+# Compendio Maestro de Arquitectura: Motor de Búsqueda Hypersonic (Rust/WASM)
+
+**Objetivo del Sistema:** Latencia <1ms, uso de memoria moderado y tamaño de binario mínimo para ejecución en navegador (WASM).
+**Alcance:** Corpus técnico pequeño/mediano (10k - 100k documentos).
+
+---
+
+## 1. Input Pipeline: Tokenización y Procesamiento NLP
+*Algoritmos encargados de transformar el texto crudo en unidades indexables, optimizados para dominios técnicos.*
+
+* **Standard Split (Ascii/Unicode):** División básica por espacios en blanco. (Línea base).
+* **Stemming (Snowball):** Reducción heurística de palabras a su raíz.
+* **BPE (Byte Pair Encoding):** Tokenización de sub-palabras con vocabulario fijo. *Recomendado para máxima compresión y manejo de vocabulario desconocido.*
+* **WordPiece / Unigram LM:** Variantes probabilísticas de tokenización de sub-palabras (estilo BERT).
+* **Synthetic Bigrams (Phrase Extraction):** Detección estadística offline de pares comunes (ej: "garbage_collector") indexados como un token único para mejorar precisión sin índice posicional.
+* **Code-Aware Semantic Tokenization:** Tokenización prescriptiva para código: preserva símbolos críticos (`++`, `#`, `@`) y divide identificadores `CamelCase`/`snake_case` en sub-tokens indexables.
+* **Entropy-Based Static Pruning:** Eliminación de términos con alta entropía (ruido/stopwords) durante la fase de construcción.
+* **Compression-aware Tokenization:** Técnicas de tokenización alineadas con el esquema de compresión posterior.
+
+## 2. Estructuras del Diccionario (Mapping Term $\to$ ID)
+*Estructuras de datos para mapear cadenas de texto a identificadores numéricos de forma eficiente.*
+
+* **Hash Map (Std/FxHash):** Mapeo estándar $O(1)$. Rápido pero ineficiente en memoria y caché.
+* **FST (Finite State Transducer):** Autómata finito que comparte prefijos y sufijos. Extremadamente compacto y permite mapeo directo desde memoria (zero-copy). *Estructura Recomendada.*
+* **MPH (Minimal Perfect Hash):** Función de hash estática perfecta (sin colisiones) calculada offline. Máxima velocidad para búsquedas exactas, pero inmutable.
+* **B-Tree / Trie:** Estructuras clásicas de árbol (descartadas por fragmentación de memoria en WASM).
+
+## 3. Reordenamiento de Documentos (Clustering)
+*Técnicas para reasignar DocIDs con el fin de minimizar los "d-gaps" (distancias) y mejorar el ratio de compresión.*
+
+* **URL / Lexicographical Sorting:** Ordenamiento simple basado en la ruta del archivo.
+* **RGB (Recursive Graph Bisection):** Algoritmo de bisección de grafos que reordena IDs para que documentos similares tengan IDs cercanos. *Estado del Arte (mejora compresión ~15-20%).*
+* **BP (Bisection Reordering):** Variante más ligera y rápida de la bisección.
+
+## 4. Almacenamiento y Compresión (Postings List Codecs)
+*Algoritmos para codificar y almacenar secuencias de DocIDs y Frecuencias.*
+
+* **VByte / VarInt:** Codificación de longitud variable alineada a bytes. (Línea base lenta).
+* **SIMD-BP128 (BitPacking):** Empaquetado de bits en bloques de 128 enteros usando instrucciones SIMD. *Estándar de alto rendimiento.*
+* **Flat Bitsets (Conjuntos de Bits Planos):** Uso de arrays de bits simples (`u64` slices) sin compresión compleja. Superior a Roaring para corpus <100k docs.
+* **SIMD-Scan (Direct Access):** Técnica para buscar valores o realizar saltos sobre datos comprimidos sin descomprimirlos a un buffer intermedio.
+* **VSEncoding (Variable Size Encoding):** Ajuste dinámico del tamaño del bloque de compresión según la distribución de datos.
+* **SIMD-FastPFor (WASM Variant):** Híbrido que usa BP128 para datos base y Bitmaps para excepciones (evitando branches).
+* **Roaring Bitmaps:** Estructura jerárquica estándar (descartada para este tamaño de corpus por overhead de indirección).
+
+## 5. Ranking y Scoring (Modelos de Relevancia)
+*Modelos matemáticos para ordenar los resultados por relevancia.*
+
+* **Dynamic BM25 (Float32):** Cálculo estándar en tiempo real (lento en WASM masivo).
+* **BM25F "Baked-In":** Aplanamiento de pesos de campos (Título vs Cuerpo) en un score único pre-calculado offline.
+* **Sigmoid Score Boosting:** Inyección de señales de frescura (fecha) o popularidad mediante una curva sigmoide aplicada al score base.
+* **Swizzle-LUT Scoring (u4):** Scoring aproximado usando enteros de 4 bits y la instrucción SIMD `pshufb` (o `i8x16.swizzle`) como tabla de búsqueda. *Optimización Target.*
+* **Quantile Binning:** Cuantización no lineal basada en percentiles para mapear scores flotantes a enteros pequeños (u4/u8).
+* **Fixed Point Arithmetic:** Simulación de aritmética decimal usando enteros.
+
+## 6. Estrategias de Ejecución, Poda y Traversal
+*Cómo se recorren las listas invertidas e intersectan documentos.*
+
+* **Ranked DAAT (Heap-Based):** Intersección Document-at-a-Time usando un BinaryHeap para mantener el Top-K.
+* **Block-Max WAND (BMW):** Poda dinámica saltando bloques enteros basada en límites superiores ($U_b$) pre-calculados.
+* **VBMW (Variable Block-Max WAND):** BMW con bloques de tamaño variable para ajustar mejor los límites superiores.
+* **Linear Time Partitioning:** Algoritmo $O(N)$ para calcular la partición óptima de bloques para VBMW.
+* **BMW-LS (Longer Skipping):** Look-ahead para saltar múltiples bloques consecutivos.
+* **Branchless WAND (Predicated):** Implementación de la lógica WAND sin `if`s, usando máscaras SIMD.
+* **SIMD Galloping:** Búsqueda exponencial vectorizada para intersecciones rápidas en listas ordenadas.
+* **Vectorized Candidate Buffer:** Reemplazo del BinaryHeap por un buffer circular vectorizado para acumulación temporal de candidatos.
+* **Tiered Traversal:** Estrategia de ejecutar primero los términos más raros para podar agresivamente.
+
+## 7. Estructuras Auxiliares y Navegación
+*Metadatos para acelerar el acceso y la precisión.*
+
+* **Elias-Fano:** Estructura sucinta monótona utilizada para codificar la lista de "Skip Pointers" (MaxDocIDs). Permite acceso aleatorio $O(1)$ comprimido.
+* **Mini-indexing / Span-based:** Bits extra en el payload para indicar posición aproximada (ej: "inicio del doc") sin el costo de un índice posicional completo.
+* **Champion Lists:** Índices separados que contienen solo el top 1-5% de documentos con mayor impacto por término.
+
+---
+
+## 8. Técnicas de Optimización e Ingeniería (Rust/WASM)
+*Compendio de optimizaciones de bajo nivel, trucos de compilador y algoritmos híbridos específicos para la arquitectura Hypersonic.*
+
+### 8.1. Micro-Optimizaciones de Código y Memoria
+1.  **SoA (Structure of Arrays):** Diseño de memoria que separa `doc_ids`, `freqs` y `scores` en arrays contiguos distintos, maximizando la localidad de caché y la eficiencia SIMD (vs `Vec<Struct>`).
+2.  **Zero-Copy Deserialization (rkyv):** Mapeo directo del archivo de índice desde el buffer de red a estructuras de Rust (`&Index`) sin pasos de parsing ni asignación de memoria en el Heap.
+3.  **MaybeUninit & Stack Allocation:** Uso de memoria no inicializada y alineada (`#[repr(align(64))]`) en el stack para buffers temporales ("scratchpads"), evitando el asignador de memoria en el bucle caliente.
+4.  **CTZ (Count Trailing Zeros):** Uso de la instrucción de hardware `trailing_zeros` para encontrar el siguiente bit activo en un Bitset instantáneamente, reemplazando bucles de iteración.
+5.  **WASM u128 Emulation Avoidance:** Uso de pares `(u64, u64)` en lugar de `u128` nativo de Rust, ya que este último suele emularse por software en WASM y degrada el rendimiento.
+6.  **SIMD Alignment:** Forzar alineación estricta a 16 bytes para evitar penalizaciones en cargas vectoriales `v128`.
+7.  **Polymorphization:** Refactorización de funciones genéricas para extraer la lógica interna a funciones estáticas no genéricas, reduciendo drásticamente el tamaño del binario ("Monomorphization Bloat").
+8.  **Panic Immediate Abort:** Configuración de `panic = "abort"` y recompilación del core (`build-std`) para eliminar toda la infraestructura de formateo de strings (`core::fmt`).
+9.  **WASM Tail Calls:** Uso de la propuesta de llamadas de cola para reescribir iteradores recursivos de grafos sin overhead de stack.
+10. **Split Loading (Component Model):** Arquitectura de carga diferida, separando el "Matcher" (núcleo) del "Scorer/Highlighter" (pesado).
+
+### 8.2. Algoritmos Híbridos y Sinergias (High-Performance Hybrids)
+*Combinaciones estratégicas detectadas para mitigar debilidades individuales.*
+
+11. **Hybrid Storage Strategy (Bitset + BP128):** Decisión en tiempo de indexación: usar **Flat Bitsets** para términos densos/comunes (intersección ultra-rápida) y **SIMD-BP128** para términos dispersos/raros (mejor compresión).
+12. **Hybrid Swizzle-WAND Execution:** La combinación definitiva de poda y scoring.
+    * *Fase Poda:* **Block-Max WAND** descarta bloques enteros que no pueden entrar en el Top-K usando metadatos ligeros.
+    * *Fase Ejecución:* Los bloques sobrevivientes se procesan usando **Swizzle-LUT Scoring**, evaluando 32 documentos por ciclo SIMD.
+13. **SvS-DAAT (Driver-Based Intersection):** Ordenar iteradores por longitud (Shortest-vs-Shortest), pero usar el más corto como **Driver** (conductor) que propone candidatos mediante *Galloping*, mientras los demás actúan como validadores pasivos (DAAT).
+14. **Hybrid Indexing (Tiered):** Uso de compresión ligera para listas de "Alto Impacto" (Champion Lists) para velocidad máxima, y compresión agresiva (FastPFor/VSEncoding) para el resto del índice.
