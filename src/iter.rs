@@ -18,6 +18,7 @@ use crate::utils::ByteSliceExt;
 pub const SCRATCH_SIZE: usize = 128;
 
 /// Internal strategy for different posting list formats.
+#[allow(clippy::large_enum_variant)]
 enum Strategy<'a> {
     Empty,
     Bitmap(BitmapState<'a>),
@@ -40,7 +41,6 @@ struct CompressedState<'a> {
     block_idx: usize,
     scratch: &'a mut [u32; SCRATCH_SIZE],
     tfs_scratch: [u32; SCRATCH_SIZE],
-    current_tf: u32,
     buf_pos: usize,
     #[cfg(target_arch = "wasm32")]
     compressed_data: &'a [u8],
@@ -221,7 +221,6 @@ impl<'a> PostingIterator<'a> {
         Self {
             strategy: Strategy::Compressed(CompressedState {
                 block_idx: 0,
-                current_tf: 1,
                 scratch,
                 headers_data,
                 last_doc_id: 0,
@@ -241,6 +240,9 @@ impl<'a> PostingIterator<'a> {
     }
 
     #[inline]
+    /// Returns the term frequency of the most recently yielded document.
+    ///
+    /// For bitmap postings this is always `1`.
     pub const fn current_tf(&self) -> u32 {
         match &self.strategy {
             Strategy::Empty => 0,
@@ -537,8 +539,7 @@ fn decompress_block(state: &mut CompressedState<'_>) {
             current = current.wrapping_add(1);
             *slot = current;
         }
-        state.scores_even.fill(10);
-        state.scores_odd.fill(10);
+        state.tfs_scratch.fill(1);
     }
 
     // --- LIMPIEZA COMÚN ---
@@ -665,14 +666,27 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
+    use fst::MapBuilder;
 
     fn make_test_index(postings: &[u8]) -> Vec<u8> {
-        let mut data = vec![0u8; 20];
-        // Magic "HYP0"
+        // Build an empty but valid FST
+        let build = MapBuilder::memory();
+        let fst_bytes = build.into_inner().unwrap();
+        let fst_len = fst_bytes.len();
+        let postings_base = 28 + fst_len;
+        let norms_offset = postings_base + postings.len();
+
+        let mut data = vec![0u8; 28];
         data[0..4].copy_from_slice(&0x4859_5030u32.to_le_bytes());
-        // Postings offset
-        data[16..20].copy_from_slice(&20u32.to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+        data[12..16].copy_from_slice(&10.0f32.to_le_bytes());
+        data[16..20].copy_from_slice(&(postings_base as u32).to_le_bytes());
+        data[20..24].copy_from_slice(&(fst_len as u32).to_le_bytes());
+        data[24..28].copy_from_slice(&(norms_offset as u32).to_le_bytes());
+
+        data.extend_from_slice(&fst_bytes);
         data.extend_from_slice(postings);
+        data.push(10); // single doc norm
         data
     }
 

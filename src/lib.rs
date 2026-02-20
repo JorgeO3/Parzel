@@ -170,7 +170,7 @@ mod tests {
             self
         }
 
-        /// Construye el blob binario final (Header + FST + Postings).
+        /// Construye el blob binario final (Header + FST + Postings + Doc Norms).
         fn build(mut self) -> Vec<u8> {
             // A. Ordenar términos alfabéticamente (Requisito de FST)
             self.terms.sort_by(|a, b| a.0.cmp(&b.0));
@@ -178,8 +178,15 @@ mod tests {
             // B. Generar Postings Data y calcular offsets para el FST
             let mut postings_data = Vec::new();
             let mut fst_inputs = Vec::new();
+            let mut max_doc = 0u32;
+            let mut has_docs = false;
 
             for (term, docs) in self.terms {
+                if let Some(&last_doc) = docs.last() {
+                    max_doc = max_doc.max(last_doc);
+                    has_docs = true;
+                }
+
                 let relative_offset = postings_data.len() as u64;
                 fst_inputs.push((term, relative_offset));
 
@@ -217,25 +224,36 @@ mod tests {
             let fst_bytes = map_build.into_inner().unwrap();
 
             // D. Ensamblar el Archivo Completo
-            let mut file = vec![0; 24];
+            let mut file = vec![0; 28];
 
             // [0..4] Magic "HYP0"
             file[0..4].copy_from_slice(&0x4859_5030u32.to_le_bytes());
+            // [8..12] Num Docs
+            let num_docs = if has_docs { max_doc + 1 } else { 1 };
+            file[8..12].copy_from_slice(&num_docs.to_le_bytes());
+            // [12..16] Avg Field Len
+            file[12..16].copy_from_slice(&10.0f32.to_le_bytes());
 
             // Offsets
             let fst_len = fst_bytes.len();
-            let postings_base = 24 + fst_len;
+            let postings_base = 28 + fst_len;
+            let norms_offset = postings_base + postings_data.len();
 
             // [16..20] Postings Base Offset
             file[16..20].copy_from_slice(&(postings_base as u32).to_le_bytes());
             // [20..24] FST Size
             file[20..24].copy_from_slice(&(fst_len as u32).to_le_bytes());
+            // [24..28] Doc Norms Offset
+            file[24..28].copy_from_slice(&(norms_offset as u32).to_le_bytes());
 
             // Append FST
             file.extend_from_slice(&fst_bytes);
 
             // Append Postings
             file.extend_from_slice(&postings_data);
+
+            // Append Doc Norms (1 byte por doc)
+            file.resize(file.len() + num_docs as usize, 10);
 
             file
         }

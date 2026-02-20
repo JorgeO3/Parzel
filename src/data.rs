@@ -44,7 +44,7 @@ impl<'a> HypersonicIndex<'a> {
 
         // 1. Validar Magic (0-4)
         let magic = data.read_u32_le(0)?;
-        if magic != 0x4859_5030 {
+        if magic != MAGIC {
             return None;
         }
 
@@ -217,29 +217,26 @@ mod tests {
 
     // Helper to create a valid index with a real FST
     fn make_valid_index_with_fst() -> Vec<u8> {
-        let mut data = vec![0u8; 24]; // Header size is now 24
-
-        // 1. Header Fields
-        data[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        // Postings offset will be after the FST. We'll set it dynamically.
-
-        // 2. Build a tiny FST
+        // 1. Build a tiny FST
         let mut build = MapBuilder::memory();
         build.insert("foo", 100).unwrap();
         build.insert("test", 200).unwrap();
         let fst_bytes = build.into_inner().unwrap();
         let fst_len = fst_bytes.len();
+        let postings_start = 28 + fst_len;
 
-        // 3. Write FST Size at offset 20
-        data[20..24].copy_from_slice(&(fst_len as u32).to_le_bytes());
-
-        // 4. Append FST
-        data.extend_from_slice(&fst_bytes);
-
-        // 5. Calculate and Write Postings Offset
-        // Postings start right after FST
-        let postings_start = 24 + fst_len;
+        // 2. Header Fields (28-byte format)
+        let mut data = vec![0u8; 28];
+        data[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        data[8..12].copy_from_slice(&1u32.to_le_bytes()); // num_docs
+        data[12..16].copy_from_slice(&10.0f32.to_le_bytes()); // avg_field_len
         data[16..20].copy_from_slice(&(postings_start as u32).to_le_bytes());
+        data[20..24].copy_from_slice(&(fst_len as u32).to_le_bytes());
+        data[24..28].copy_from_slice(&(postings_start as u32).to_le_bytes()); // norms_offset
+
+        // 3. Append FST and one dummy doc norm
+        data.extend_from_slice(&fst_bytes);
+        data.push(10);
 
         data
     }
@@ -267,10 +264,10 @@ mod tests {
     #[test]
     fn invalid_fst_data() {
         let mut data = make_valid_index_with_fst();
-        // Corrupt the FST bytes (start at 24)
-        if data.len() > 24 {
-            data[24] = 0xFF;
-            data[25] = 0xFF;
+        // Corrupt the FST bytes (start at 28)
+        if data.len() > 29 {
+            data[28] = 0xFF;
+            data[29] = 0xFF;
         }
         // Map::new should fail validation
         assert!(HypersonicIndex::new(&data).is_none());
